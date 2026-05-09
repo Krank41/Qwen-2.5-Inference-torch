@@ -1,5 +1,25 @@
 #!/usr/bin/env python3
 """
+
+
+
+mkdir -p qwen25_05b_instruct
+cd qwen25_05b_instruct
+
+curl -L -O https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct/resolve/main/config.json
+curl -L -O https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct/resolve/main/tokenizer_config.json
+curl -L -O https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct/resolve/main/vocab.json
+curl -L -O https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct/resolve/main/merges.txt
+curl -L -O https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct/resolve/main/model.safetensors
+
+cd ..
+
+
+python qwen25_pure_torch.py \
+  --model-dir ./qwen25_05b_instruct \
+  --prompt "Explain attention in transformers in 3 bullet points."
+
+  
 Pure PyTorch Qwen2.5-0.5B-Instruct inference.
 
 Runtime dependencies:
