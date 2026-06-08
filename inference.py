@@ -1,950 +1,735 @@
-#!/usr/bin/env python3
-"""
+
+
+## Qwen3 From Scratch (A Standalone Notebook)
+
+# pip install -r https://raw.githubusercontent.com/rasbt/LLMs-from-scratch/refs/heads/main/ch05/07_gpt_to_llama/requirements-extra.txt
+
+from importlib.metadata import version
+
+pkgs = [
+    "huggingface_hub",  # to download pretrained weights
+    "tokenizers",       # to implement the tokenizer
+    "torch",            # to implement the model
+]
+for p in pkgs:
+    print(f"{p} version: {version(p)}")
 
 
 
-mkdir -p qwen25_05b_instruct
-cd qwen25_05b_instruct
+# Select which model to use via the following flag; only one can be True
 
-curl -L -O https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct/resolve/main/config.json
-curl -L -O https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct/resolve/main/tokenizer_config.json
-curl -L -O https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct/resolve/main/vocab.json
-curl -L -O https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct/resolve/main/merges.txt
-curl -L -O https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct/resolve/main/model.safetensors
+USE_BASE_MODEL = False
+USE_REASONING_MODEL = True 
+USE_INSTRUCT_MODEL = False
 
-cd ..
+if (USE_BASE_MODEL + USE_REASONING_MODEL
+    + USE_INSTRUCT_MODEL) != 1:
+    raise AttributeError("Only one of the options above can be True.")
 
 
-python qwen25_pure_torch.py \
-  --model-dir ./qwen25_05b_instruct \
-  --prompt "Explain attention in transformers in 3 bullet points."
-
-  
-Pure PyTorch Qwen2.5-0.5B-Instruct inference.
-
-Runtime dependencies:
-  - torch
-  - Python standard library
-
-No transformers, tokenizers, huggingface_hub, accelerate, or safetensors package.
-
-Expected model directory files:
-  config.json
-  model.safetensors
-  vocab.json + merges.txt
-  tokenizer_config.json   optional but recommended
-
-Example:
-  python qwen25_pure_torch.py --model-dir ./qwen25_05b_instruct --prompt "Write a haiku about GPUs."
-"""
-
-from __future__ import annotations
-
-import argparse
-import glob
-import json
-import math
-import mmap
-import os
-import re
-import struct
-import unicodedata
-import warnings
-from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
-
+############# 1. Architecture Code
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
-# -----------------------------
-# Minimal safetensors reader
-# -----------------------------
-
-_SAFE_DTYPE_TO_TORCH = {
-    "F64": torch.float64,
-    "F32": torch.float32,
-    "F16": torch.float16,
-    "BF16": torch.bfloat16,
-    "I64": torch.int64,
-    "I32": torch.int32,
-    "I16": torch.int16,
-    "I8": torch.int8,
-    "U8": torch.uint8,
-    "BOOL": torch.bool,
-}
-
-
-def _prod(xs: Sequence[int]) -> int:
-    out = 1
-    for x in xs:
-        out *= int(x)
-    return out
-
-
-def _read_safetensors_header(path: str) -> Tuple[int, dict]:
-    with open(path, "rb") as f:
-        first8 = f.read(8)
-        if len(first8) != 8:
-            raise ValueError(f"{path} is too small to be a safetensors file.")
-        header_len = struct.unpack("<Q", first8)[0]
-        header = json.loads(f.read(header_len))
-    return header_len, header
-
-
-def load_safetensors_into_model(model: nn.Module, model_dir: str) -> None:
-    safetensor_paths = sorted(glob.glob(os.path.join(model_dir, "*.safetensors")))
-    if not safetensor_paths:
-        raise FileNotFoundError(f"No .safetensors files found in: {model_dir}")
-
-    params = dict(model.named_parameters())
-    loaded = set()
-    unexpected = []
-
-    with torch.no_grad():
-        for path in safetensor_paths:
-            header_len, header = _read_safetensors_header(path)
-            data_base = 8 + header_len
-
-            with open(path, "rb") as f:
-                mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
-                try:
-                    for name, info in header.items():
-                        if name == "__metadata__":
-                            continue
-
-                        # Hugging Face Qwen2ForCausalLM stores the transformer under
-                        # the "model." prefix. This file keeps the module flatter, so
-                        # map "model.layers..." -> "layers..." etc.
-                        target_name = name
-                        if target_name not in params and target_name.startswith("model."):
-                            target_name = target_name[len("model.") :]
-
-                        # This implementation ties lm_head to embeddings directly, so a
-                        # separate lm_head.weight, if present, is intentionally ignored.
-                        if name == "lm_head.weight" and target_name not in params:
-                            continue
-
-                        if target_name not in params:
-                            unexpected.append(name)
-                            continue
-
-                        dtype_name = info["dtype"]
-                        shape = tuple(int(x) for x in info["shape"])
-                        start, end = info["data_offsets"]
-                        dtype = _SAFE_DTYPE_TO_TORCH[dtype_name]
-                        numel = _prod(shape)
-
-                        with warnings.catch_warnings():
-                            warnings.filterwarnings(
-                                "ignore",
-                                message="The given buffer is not writable",
-                                category=UserWarning,
-                            )
-                            tensor = torch.frombuffer(
-                                mm,
-                                dtype=dtype,
-                                count=numel,
-                                offset=data_base + int(start),
-                            ).reshape(shape)
-
-                        param = params[target_name]
-                        if tuple(param.shape) != shape:
-                            raise ValueError(
-                                f"Shape mismatch for {name}: checkpoint {shape}, model {tuple(param.shape)}"
-                            )
-
-                        param.copy_(tensor.to(device=param.device, dtype=param.dtype))
-                        loaded.add(target_name)
-
-                    # Make sure all asynchronous device copies finish before the mmap closes.
-                    if any(p.device.type == "cuda" for p in params.values()):
-                        torch.cuda.synchronize()
-                finally:
-                    mm.close()
-
-    missing = [name for name in params if name not in loaded]
-    if missing:
-        sample = ", ".join(missing[:10])
-        raise RuntimeError(f"Missing {len(missing)} tensors from checkpoint. First missing: {sample}")
-
-    if unexpected:
-        print(f"Warning: ignored {len(unexpected)} unexpected checkpoint tensors. First: {unexpected[:5]}")
-
-
-# -----------------------------
-# Qwen2 tokenizer, pure Python
-# -----------------------------
-
-def bytes_to_unicode() -> Tuple[Dict[int, str], Dict[str, int]]:
-    # GPT-2 / ByteLevel reversible byte-to-unicode map.
-    bs = list(range(ord("!"), ord("~") + 1))
-    bs += list(range(ord("¡"), ord("¬") + 1))
-    bs += list(range(ord("®"), ord("ÿ") + 1))
-    cs = bs[:]
-    n = 0
-    for b in range(256):
-        if b not in bs:
-            bs.append(b)
-            cs.append(256 + n)
-            n += 1
-    byte_encoder = {b: chr(c) for b, c in zip(bs, cs)}
-    byte_decoder = {v: k for k, v in byte_encoder.items()}
-    return byte_encoder, byte_decoder
-
-
-def _is_letter(ch: str) -> bool:
-    return bool(ch) and unicodedata.category(ch).startswith("L")
-
-
-def _is_number(ch: str) -> bool:
-    return bool(ch) and unicodedata.category(ch).startswith("N")
-
-
-def _is_space(ch: str) -> bool:
-    return bool(ch) and ch.isspace()
-
-
-def _is_crlf(ch: str) -> bool:
-    return ch == "\r" or ch == "\n"
-
-
-def qwen_pretokenize(text: str) -> List[str]:
-    r"""
-    Implements the Qwen2 pre-tokenization regex in stdlib Python:
-      (?i:'s|'t|'re|'ve|'m|'ll|'d)
-      |[^\r\n\p{L}\p{N}]?\p{L}+
-      |\p{N}
-      | ?[^\s\p{L}\p{N}]+[\r\n]*
-      |\s*[\r\n]+
-      |\s+(?!\S)
-      |\s+
-    """
-    out: List[str] = []
-    i = 0
-    n = len(text)
-    contractions = ("'re", "'ve", "'ll", "'s", "'t", "'m", "'d")
-
-    while i < n:
-        # 1) contractions, case-insensitive
-        matched = None
-        for c in contractions:
-            if text[i : i + len(c)].lower() == c:
-                matched = text[i : i + len(c)]
-                break
-        if matched is not None:
-            out.append(matched)
-            i += len(matched)
-            continue
-
-        ch = text[i]
-
-        # 2) optional non-CRLF/non-letter/non-number prefix + letters
-        if _is_letter(ch) or (
-            not _is_crlf(ch)
-            and not _is_letter(ch)
-            and not _is_number(ch)
-            and i + 1 < n
-            and _is_letter(text[i + 1])
-        ):
-            j = i
-            if not _is_letter(text[j]):
-                j += 1
-            if j < n and _is_letter(text[j]):
-                j += 1
-                while j < n and _is_letter(text[j]):
-                    j += 1
-                out.append(text[i:j])
-                i = j
-                continue
-
-        # 3) single numeric character
-        if _is_number(ch):
-            out.append(ch)
-            i += 1
-            continue
-
-        # 4) optional ASCII space + punctuation/symbol run + optional CR/LF
-        if (
-            ch == " "
-            and i + 1 < n
-            and (not _is_space(text[i + 1]))
-            and (not _is_letter(text[i + 1]))
-            and (not _is_number(text[i + 1]))
-        ):
-            j = i + 1
-            while j < n and (not _is_space(text[j])) and (not _is_letter(text[j])) and (not _is_number(text[j])):
-                j += 1
-            while j < n and _is_crlf(text[j]):
-                j += 1
-            out.append(text[i:j])
-            i = j
-            continue
-
-        if (not _is_space(ch)) and (not _is_letter(ch)) and (not _is_number(ch)):
-            j = i + 1
-            while j < n and (not _is_space(text[j])) and (not _is_letter(text[j])) and (not _is_number(text[j])):
-                j += 1
-            while j < n and _is_crlf(text[j]):
-                j += 1
-            out.append(text[i:j])
-            i = j
-            continue
-
-        # 5) whitespace ending in a CR/LF run
-        if _is_space(ch):
-            j = i
-            while j < n and _is_space(text[j]):
-                j += 1
-
-            last_newline = -1
-            k = i
-            while k < j:
-                if _is_crlf(text[k]):
-                    last_newline = k
-                k += 1
-
-            if last_newline >= 0:
-                end = last_newline + 1
-                while end < j and _is_crlf(text[end]):
-                    end += 1
-                out.append(text[i:end])
-                i = end
-                continue
-
-            # 6/7) ordinary whitespace, including trailing whitespace
-            out.append(text[i:j])
-            i = j
-            continue
-
-        # Fallback: should not be reached, but keeps the tokenizer total.
-        out.append(ch)
-        i += 1
-
-    return out
-
-
-def get_pairs(word: Tuple[str, ...]) -> set[Tuple[str, str]]:
-    if len(word) < 2:
-        return set()
-    return set(zip(word, word[1:]))
-
-
-class Qwen2TokenizerPure:
-    def __init__(self, model_dir: str):
-        vocab_path = os.path.join(model_dir, "vocab.json")
-        merges_path = os.path.join(model_dir, "merges.txt")
-        tokenizer_json_path = os.path.join(model_dir, "tokenizer.json")
-
-        if os.path.exists(vocab_path) and os.path.exists(merges_path):
-            with open(vocab_path, "r", encoding="utf-8") as f:
-                self.vocab: Dict[str, int] = json.load(f)
-            merges = self._load_merges_txt(merges_path)
-        elif os.path.exists(tokenizer_json_path):
-            with open(tokenizer_json_path, "r", encoding="utf-8") as f:
-                tok = json.load(f)
-            self.vocab = tok["model"]["vocab"]
-            merges = tok["model"]["merges"]
-            merges = [tuple(m) if isinstance(m, list) else tuple(m.split()) for m in merges]
-        else:
-            raise FileNotFoundError(
-                "Need vocab.json + merges.txt, or tokenizer.json, in the model directory."
-            )
-
-        self.id_to_token = {idx: tok for tok, idx in self.vocab.items()}
-        self.bpe_ranks: Dict[Tuple[str, str], int] = {tuple(m): i for i, m in enumerate(merges)}
-        self.cache: Dict[str, List[str]] = {}
-
-        self.byte_encoder, self.byte_decoder = bytes_to_unicode()
-
-        self.special_tokens = self._load_special_tokens(model_dir)
-        self.special_tokens = {tok for tok in self.special_tokens if tok in self.vocab}
-        self.special_pattern: Optional[re.Pattern[str]]
-        if self.special_tokens:
-            pieces = sorted((re.escape(s) for s in self.special_tokens), key=len, reverse=True)
-            self.special_pattern = re.compile("(" + "|".join(pieces) + ")")
-        else:
-            self.special_pattern = None
-
-        self.eos_token = "<|im_end|>"
-        self.pad_token = "<|endoftext|>"
-        self.im_start = "<|im_start|>"
-        self.im_end = "<|im_end|>"
-
-        self.eos_token_id = self.vocab[self.eos_token]
-        self.pad_token_id = self.vocab.get(self.pad_token, self.eos_token_id)
-
-    @staticmethod
-    def _load_merges_txt(path: str) -> List[Tuple[str, str]]:
-        merges: List[Tuple[str, str]] = []
-        with open(path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.rstrip("\n")
-                if not line or line.startswith("#"):
-                    continue
-                parts = line.split()
-                if len(parts) == 2:
-                    merges.append((parts[0], parts[1]))
-        return merges
-
-    def _load_special_tokens(self, model_dir: str) -> set[str]:
-        special = {"<|endoftext|>", "<|im_start|>", "<|im_end|>"}
-        cfg_path = os.path.join(model_dir, "tokenizer_config.json")
-        if os.path.exists(cfg_path):
-            with open(cfg_path, "r", encoding="utf-8") as f:
-                cfg = json.load(f)
-
-            for key in ("bos_token", "eos_token", "pad_token", "unk_token"):
-                val = cfg.get(key)
-                if isinstance(val, str):
-                    special.add(val)
-                elif isinstance(val, dict) and isinstance(val.get("content"), str):
-                    special.add(val["content"])
-
-            for tok in cfg.get("additional_special_tokens", []) or []:
-                if isinstance(tok, str):
-                    special.add(tok)
-                elif isinstance(tok, dict) and isinstance(tok.get("content"), str):
-                    special.add(tok["content"])
-
-            dec = cfg.get("added_tokens_decoder", {}) or {}
-            for entry in dec.values():
-                if isinstance(entry, dict) and entry.get("special") and isinstance(entry.get("content"), str):
-                    special.add(entry["content"])
-
-        return special
-
-    def bpe(self, token: str) -> List[str]:
-        cached = self.cache.get(token)
-        if cached is not None:
-            return cached
-
-        word = tuple(token)
-        if len(word) == 1:
-            self.cache[token] = [token]
-            return [token]
-
-        while True:
-            pairs = get_pairs(word)
-            if not pairs:
-                break
-            bigram = min(pairs, key=lambda pair: self.bpe_ranks.get(pair, float("inf")))
-            if bigram not in self.bpe_ranks:
-                break
-
-            first, second = bigram
-            new_word: List[str] = []
-            i = 0
-            while i < len(word):
-                try:
-                    j = word.index(first, i)
-                    new_word.extend(word[i:j])
-                    i = j
-                except ValueError:
-                    new_word.extend(word[i:])
-                    break
-
-                if i < len(word) - 1 and word[i] == first and word[i + 1] == second:
-                    new_word.append(first + second)
-                    i += 2
-                else:
-                    new_word.append(word[i])
-                    i += 1
-
-            word = tuple(new_word)
-            if len(word) == 1:
-                break
-
-        out = list(word)
-        self.cache[token] = out
-        return out
-
-    def _encode_normal_text(self, text: str) -> List[int]:
-        text = unicodedata.normalize("NFC", text)
-        ids: List[int] = []
-
-        for piece in qwen_pretokenize(text):
-            byte_level = "".join(self.byte_encoder[b] for b in piece.encode("utf-8"))
-            for bpe_piece in self.bpe(byte_level):
-                try:
-                    ids.append(self.vocab[bpe_piece])
-                except KeyError as exc:
-                    raise KeyError(f"Tokenizer piece not found in vocab: {bpe_piece!r}") from exc
-
-        return ids
-
-    def encode(self, text: str) -> List[int]:
-        if not text:
-            return []
-
-        if self.special_pattern is None:
-            return self._encode_normal_text(text)
-
-        ids: List[int] = []
-        pos = 0
-        for match in self.special_pattern.finditer(text):
-            if match.start() > pos:
-                ids.extend(self._encode_normal_text(text[pos : match.start()]))
-            special = match.group(0)
-            ids.append(self.vocab[special])
-            pos = match.end()
-
-        if pos < len(text):
-            ids.extend(self._encode_normal_text(text[pos:]))
-
-        return ids
-
-    def decode(self, ids: Iterable[int], skip_special_tokens: bool = True) -> str:
-        byte_buffer = bytearray()
-        text_parts: List[str] = []
-
-        def flush_bytes() -> None:
-            nonlocal byte_buffer
-            if byte_buffer:
-                text_parts.append(bytes(byte_buffer).decode("utf-8", errors="replace"))
-                byte_buffer = bytearray()
-
-        for idx in ids:
-            token = self.id_to_token.get(int(idx), "")
-            if skip_special_tokens and token in self.special_tokens:
-                continue
-
-            if token in self.special_tokens:
-                flush_bytes()
-                text_parts.append(token)
-                continue
-
-            for ch in token:
-                b = self.byte_decoder.get(ch)
-                if b is None:
-                    flush_bytes()
-                    text_parts.append(ch)
-                else:
-                    byte_buffer.append(b)
-
-        flush_bytes()
-        return "".join(text_parts)
-
-    def apply_chat_template(
-        self,
-        messages: List[dict],
-        add_generation_prompt: bool = True,
-    ) -> str:
-        if not messages or messages[0].get("role") != "system":
-            messages = [
-                {
-                    "role": "system",
-                    "content": "You are Qwen, created by Alibaba Cloud. You are a helpful assistant.",
-                }
-            ] + messages
-
-        chunks: List[str] = []
-        for msg in messages:
-            role = msg["role"]
-            content = msg.get("content", "")
-            chunks.append(f"{self.im_start}{role}\n{content}{self.im_end}\n")
-
-        if add_generation_prompt:
-            chunks.append(f"{self.im_start}assistant\n")
-
-        return "".join(chunks)
-
-
-# -----------------------------
-# Qwen2 model, pure PyTorch
-# -----------------------------
-
-@dataclass
-class Qwen2ConfigPure:
-    vocab_size: int
-    hidden_size: int
-    intermediate_size: int
-    num_hidden_layers: int
-    num_attention_heads: int
-    num_key_value_heads: int
-    rms_norm_eps: float
-    rope_theta: float
-    max_position_embeddings: int
-    eos_token_id: int
-    tie_word_embeddings: bool = True
-
-    @classmethod
-    def from_json(cls, path: str) -> "Qwen2ConfigPure":
-        with open(path, "r", encoding="utf-8") as f:
-            cfg = json.load(f)
-
-        return cls(
-            vocab_size=int(cfg["vocab_size"]),
-            hidden_size=int(cfg["hidden_size"]),
-            intermediate_size=int(cfg["intermediate_size"]),
-            num_hidden_layers=int(cfg["num_hidden_layers"]),
-            num_attention_heads=int(cfg["num_attention_heads"]),
-            num_key_value_heads=int(cfg["num_key_value_heads"]),
-            rms_norm_eps=float(cfg.get("rms_norm_eps", 1e-6)),
-            rope_theta=float(cfg.get("rope_theta", 1_000_000.0)),
-            max_position_embeddings=int(cfg.get("max_position_embeddings", 32768)),
-            eos_token_id=int(cfg.get("eos_token_id", 151645)),
-            tie_word_embeddings=bool(cfg.get("tie_word_embeddings", True)),
-        )
-
-
-class Qwen2RMSNorm(nn.Module):
-    def __init__(self, hidden_size: int, eps: float, *, device: torch.device, dtype: torch.dtype):
+class FeedForward(nn.Module):
+    def __init__(self, cfg):
         super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size, device=device, dtype=dtype))
+        self.fc1 = nn.Linear(cfg["emb_dim"], cfg["hidden_dim"], dtype=cfg["dtype"], bias=False)
+        self.fc2 = nn.Linear(cfg["emb_dim"], cfg["hidden_dim"], dtype=cfg["dtype"], bias=False)
+        self.fc3 = nn.Linear(cfg["hidden_dim"], cfg["emb_dim"], dtype=cfg["dtype"], bias=False)
+
+    def forward(self, x):
+        x_fc1 = self.fc1(x)
+        x_fc2 = self.fc2(x)
+        x = nn.functional.silu(x_fc1) * x_fc2
+        return self.fc3(x)
+
+
+class RMSNorm(nn.Module):
+    def __init__(self, emb_dim, eps=1e-6, bias=False, qwen3_compatible=True):
+        super().__init__()
         self.eps = eps
+        self.qwen3_compatible = qwen3_compatible
+        self.scale = nn.Parameter(torch.ones(emb_dim))
+        self.shift = nn.Parameter(torch.zeros(emb_dim)) if bias else None
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        original_dtype = x.dtype
-        x_float = x.float()
-        variance = x_float.pow(2).mean(dim=-1, keepdim=True)
-        x_norm = x_float * torch.rsqrt(variance + self.eps)
-        return self.weight * x_norm.to(original_dtype)
+    def forward(self, x):
+        input_dtype = x.dtype
 
+        if self.qwen3_compatible:
+            x = x.to(torch.float32)
 
-def rotate_half(x: torch.Tensor) -> torch.Tensor:
-    half = x.shape[-1] // 2
-    x1 = x[..., :half]
-    x2 = x[..., half:]
-    return torch.cat((-x2, x1), dim=-1)
+        variance = x.pow(2).mean(dim=-1, keepdim=True)
+        norm_x = x * torch.rsqrt(variance + self.eps)
+        norm_x = norm_x * self.scale
 
+        if self.shift is not None:
+            norm_x = norm_x + self.shift
 
-def apply_rope(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    position_ids: torch.Tensor,
-    inv_freq: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    # q: [B, QH, T, D], k: [B, KVH, T, D]
-    freqs = torch.einsum("bt,d->btd", position_ids.float(), inv_freq.float())
-    emb = torch.cat((freqs, freqs), dim=-1)
-    cos = emb.cos().to(dtype=q.dtype).unsqueeze(1)
-    sin = emb.sin().to(dtype=q.dtype).unsqueeze(1)
-
-    q = (q * cos) + (rotate_half(q) * sin)
-    k = (k * cos) + (rotate_half(k) * sin)
-    return q, k
+        return norm_x.to(input_dtype)
 
 
-def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
-    # [B, KVH, T, D] -> [B, QH, T, D]
-    if n_rep == 1:
-        return x
-    bsz, kv_heads, seq_len, head_dim = x.shape
-    x = x[:, :, None, :, :].expand(bsz, kv_heads, n_rep, seq_len, head_dim)
-    return x.reshape(bsz, kv_heads * n_rep, seq_len, head_dim)
+def compute_rope_params(head_dim, theta_base=10_000, context_length=4096, dtype=torch.float32):
+    assert head_dim % 2 == 0, "Embedding dimension must be even"
+
+    # Compute the inverse frequencies
+    inv_freq = 1.0 / (theta_base ** (torch.arange(0, head_dim, 2, dtype=dtype)[: (head_dim // 2)].float() / head_dim))
+
+    # Generate position indices
+    positions = torch.arange(context_length, dtype=dtype)
+
+    # Compute the angles
+    angles = positions.unsqueeze(1) * inv_freq.unsqueeze(0)  # Shape: (context_length, head_dim // 2)
+
+    # Expand angles to match the head_dim
+    angles = torch.cat([angles, angles], dim=1)  # Shape: (context_length, head_dim)
+
+    # Precompute sine and cosine
+    cos = torch.cos(angles)
+    sin = torch.sin(angles)
+
+    return cos, sin
 
 
-class Qwen2MLP(nn.Module):
-    def __init__(self, cfg: Qwen2ConfigPure, *, device: torch.device, dtype: torch.dtype):
+def apply_rope(x, cos, sin):
+    # x: (batch_size, num_heads, seq_len, head_dim)
+    batch_size, num_heads, seq_len, head_dim = x.shape
+    assert head_dim % 2 == 0, "Head dimension must be even"
+
+    # Split x into first half and second half
+    x1 = x[..., : head_dim // 2]  # First half
+    x2 = x[..., head_dim // 2 :]  # Second half
+
+    # Adjust sin and cos shapes
+    cos = cos[:seq_len, :].unsqueeze(0).unsqueeze(0)  # Shape: (1, 1, seq_len, head_dim)
+    sin = sin[:seq_len, :].unsqueeze(0).unsqueeze(0)
+
+    # Apply the rotary transformation
+    rotated = torch.cat((-x2, x1), dim=-1)
+    x_rotated = (x * cos) + (rotated * sin)
+
+    # It's ok to use lower-precision after applying cos and sin rotation
+    return x_rotated.to(dtype=x.dtype)
+
+
+class GroupedQueryAttention(nn.Module):
+    def __init__(
+        self, d_in, num_heads, num_kv_groups, head_dim=None, qk_norm=False, dtype=None
+    ):
         super().__init__()
-        self.gate_proj = nn.Linear(cfg.hidden_size, cfg.intermediate_size, bias=False, device=device, dtype=dtype)
-        self.up_proj = nn.Linear(cfg.hidden_size, cfg.intermediate_size, bias=False, device=device, dtype=dtype)
-        self.down_proj = nn.Linear(cfg.intermediate_size, cfg.hidden_size, bias=False, device=device, dtype=dtype)
+        assert num_heads % num_kv_groups == 0, "num_heads must be divisible by num_kv_groups"
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+        self.num_heads = num_heads
+        self.num_kv_groups = num_kv_groups
+        self.group_size = num_heads // num_kv_groups
 
+        if head_dim is None:
+            assert d_in % num_heads == 0, "`d_in` must be divisible by `num_heads` if `head_dim` is not set"
+            head_dim = d_in // num_heads
 
-class Qwen2Attention(nn.Module):
-    def __init__(self, cfg: Qwen2ConfigPure, *, device: torch.device, dtype: torch.dtype):
-        super().__init__()
-        self.hidden_size = cfg.hidden_size
-        self.num_heads = cfg.num_attention_heads
-        self.num_kv_heads = cfg.num_key_value_heads
-        self.head_dim = cfg.hidden_size // cfg.num_attention_heads
-        self.num_kv_groups = cfg.num_attention_heads // cfg.num_key_value_heads
-        self.scaling = self.head_dim ** -0.5
+        self.head_dim = head_dim
+        self.d_out = num_heads * head_dim
 
-        inv_freq = 1.0 / (
-            cfg.rope_theta
-            ** (torch.arange(0, self.head_dim, 2, device=device, dtype=torch.float32) / self.head_dim)
-        )
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self.W_query = nn.Linear(d_in, self.d_out, bias=False, dtype=dtype)
+        self.W_key = nn.Linear(d_in, num_kv_groups * head_dim, bias=False, dtype=dtype)
+        self.W_value = nn.Linear(d_in, num_kv_groups * head_dim, bias=False, dtype=dtype)
 
-        self.q_proj = nn.Linear(cfg.hidden_size, self.num_heads * self.head_dim, bias=True, device=device, dtype=dtype)
-        self.k_proj = nn.Linear(cfg.hidden_size, self.num_kv_heads * self.head_dim, bias=True, device=device, dtype=dtype)
-        self.v_proj = nn.Linear(cfg.hidden_size, self.num_kv_heads * self.head_dim, bias=True, device=device, dtype=dtype)
-        self.o_proj = nn.Linear(self.num_heads * self.head_dim, cfg.hidden_size, bias=False, device=device, dtype=dtype)
+        self.out_proj = nn.Linear(self.d_out, d_in, bias=False, dtype=dtype)
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        position_ids: torch.Tensor,
-        past_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-        use_cache: bool = True,
-    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
-        bsz, q_len, _ = x.shape
-
-        q = self.q_proj(x).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        k = self.k_proj(x).view(bsz, q_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        v = self.v_proj(x).view(bsz, q_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
-
-        q, k = apply_rope(q, k, position_ids, self.inv_freq)
-
-        past_len = 0
-        if past_kv is not None:
-            past_k, past_v = past_kv
-            past_len = past_k.shape[2]
-            k = torch.cat((past_k, k), dim=2)
-            v = torch.cat((past_v, v), dim=2)
-
-        new_kv = (k, v) if use_cache else None
-
-        k_rep = repeat_kv(k, self.num_kv_groups)
-        v_rep = repeat_kv(v, self.num_kv_groups)
-
-        attn_scores = torch.matmul(q, k_rep.transpose(-2, -1)) * self.scaling
-
-        key_len = k_rep.shape[2]
-        if q_len > 1:
-            query_positions = torch.arange(past_len, past_len + q_len, device=x.device)[:, None]
-            key_positions = torch.arange(0, key_len, device=x.device)[None, :]
-            causal_mask = key_positions > query_positions
-            attn_scores = attn_scores.masked_fill(causal_mask[None, None, :, :], torch.finfo(attn_scores.dtype).min)
-
-        attn_probs = F.softmax(attn_scores.float(), dim=-1).to(dtype=q.dtype)
-        attn_out = torch.matmul(attn_probs, v_rep)
-        attn_out = attn_out.transpose(1, 2).contiguous().view(bsz, q_len, self.hidden_size)
-        return self.o_proj(attn_out), new_kv
-
-
-class Qwen2DecoderLayer(nn.Module):
-    def __init__(self, cfg: Qwen2ConfigPure, *, device: torch.device, dtype: torch.dtype):
-        super().__init__()
-        self.self_attn = Qwen2Attention(cfg, device=device, dtype=dtype)
-        self.mlp = Qwen2MLP(cfg, device=device, dtype=dtype)
-        self.input_layernorm = Qwen2RMSNorm(cfg.hidden_size, cfg.rms_norm_eps, device=device, dtype=dtype)
-        self.post_attention_layernorm = Qwen2RMSNorm(cfg.hidden_size, cfg.rms_norm_eps, device=device, dtype=dtype)
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        position_ids: torch.Tensor,
-        past_kv: Optional[Tuple[torch.Tensor, torch.Tensor]],
-        use_cache: bool,
-    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
-        residual = x
-        attn_out, new_kv = self.self_attn(
-            self.input_layernorm(x),
-            position_ids=position_ids,
-            past_kv=past_kv,
-            use_cache=use_cache,
-        )
-        x = residual + attn_out
-
-        residual = x
-        x = residual + self.mlp(self.post_attention_layernorm(x))
-        return x, new_kv
-
-
-class Qwen2ForCausalLMPure(nn.Module):
-    def __init__(self, cfg: Qwen2ConfigPure, *, device: torch.device, dtype: torch.dtype):
-        super().__init__()
-        if cfg.hidden_size % cfg.num_attention_heads != 0:
-            raise ValueError("hidden_size must be divisible by num_attention_heads.")
-        if cfg.num_attention_heads % cfg.num_key_value_heads != 0:
-            raise ValueError("num_attention_heads must be divisible by num_key_value_heads.")
-        if not cfg.tie_word_embeddings:
-            raise ValueError("This minimal implementation expects tied word embeddings.")
-
-        self.cfg = cfg
-        self.embed_tokens = nn.Embedding(cfg.vocab_size, cfg.hidden_size, device=device, dtype=dtype)
-        self.layers = nn.ModuleList(
-            [Qwen2DecoderLayer(cfg, device=device, dtype=dtype) for _ in range(cfg.num_hidden_layers)]
-        )
-        self.norm = Qwen2RMSNorm(cfg.hidden_size, cfg.rms_norm_eps, device=device, dtype=dtype)
-
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
-        use_cache: bool = True,
-    ) -> Tuple[torch.Tensor, Optional[List[Tuple[torch.Tensor, torch.Tensor]]]]:
-        bsz, seq_len = input_ids.shape
-        if past_key_values is None:
-            past_key_values = [None] * len(self.layers)  # type: ignore[list-item]
-            past_len = 0
+        if qk_norm:
+            self.q_norm = RMSNorm(head_dim, eps=1e-6)
+            self.k_norm = RMSNorm(head_dim, eps=1e-6)
         else:
-            past_len = past_key_values[0][0].shape[2] if past_key_values[0] is not None else 0
+            self.q_norm = self.k_norm = None
 
-        position_ids = torch.arange(
-            past_len,
-            past_len + seq_len,
-            device=input_ids.device,
-            dtype=torch.long,
-        ).unsqueeze(0).expand(bsz, -1)
+    def forward(self, x, mask, cos, sin):
+        b, num_tokens, _ = x.shape
 
-        x = self.embed_tokens(input_ids)
-        new_cache: List[Tuple[torch.Tensor, torch.Tensor]] = []
+        # Apply projections
+        queries = self.W_query(x)  # (b, num_tokens, num_heads * head_dim)
+        keys = self.W_key(x)       # (b, num_tokens, num_kv_groups * head_dim)
+        values = self.W_value(x)   # (b, num_tokens, num_kv_groups * head_dim)
 
-        for layer, layer_past in zip(self.layers, past_key_values):
-            x, layer_cache = layer(x, position_ids=position_ids, past_kv=layer_past, use_cache=use_cache)
-            if use_cache:
-                assert layer_cache is not None
-                new_cache.append(layer_cache)
+        # Reshape
+        queries = queries.view(b, num_tokens, self.num_heads, self.head_dim).transpose(1, 2)
+        keys = keys.view(b, num_tokens, self.num_kv_groups, self.head_dim).transpose(1, 2)
+        values = values.view(b, num_tokens, self.num_kv_groups, self.head_dim).transpose(1, 2)
 
-        x = self.norm(x)
+        # Optional normalization
+        if self.q_norm:
+            queries = self.q_norm(queries)
+        if self.k_norm:
+            keys = self.k_norm(keys)
 
-        # Tied output projection: logits = hidden @ embedding.T
-        logits = F.linear(x, self.embed_tokens.weight)
-        return logits, new_cache if use_cache else None
+        # Apply RoPE
+        queries = apply_rope(queries, cos, sin)
+        keys = apply_rope(keys, cos, sin)
 
+        # Expand K and V to match number of heads
+        keys = keys.repeat_interleave(self.group_size, dim=1)
+        values = values.repeat_interleave(self.group_size, dim=1)
 
-# -----------------------------
-# Generation
-# -----------------------------
+        # Attention
+        attn_scores = queries @ keys.transpose(2, 3)
+        attn_scores = attn_scores.masked_fill(mask, -torch.inf)
+        attn_weights = torch.softmax(attn_scores / self.head_dim**0.5, dim=-1)
 
-def pick_dtype(name: str, device: torch.device) -> torch.dtype:
-    name = name.lower()
-    if name == "auto":
-        if device.type == "cuda":
-            major, _ = torch.cuda.get_device_capability(device)
-            return torch.bfloat16 if major >= 8 else torch.float16
-        return torch.float32
-    if name in {"bf16", "bfloat16"}:
-        return torch.bfloat16
-    if name in {"fp16", "float16", "half"}:
-        return torch.float16
-    if name in {"fp32", "float32"}:
-        return torch.float32
-    raise ValueError(f"Unknown dtype: {name}")
+        context = (attn_weights @ values).transpose(1, 2).reshape(b, num_tokens, self.d_out)
+        return self.out_proj(context)
 
 
-def sample_next_token(logits: torch.Tensor, temperature: float, top_p: float) -> torch.Tensor:
-    # logits: [1, vocab]
-    if temperature <= 0:
-        return torch.argmax(logits, dim=-1)
 
-    logits = logits / temperature
+class TransformerBlock(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.att = GroupedQueryAttention(
+            d_in=cfg["emb_dim"],
+            num_heads=cfg["n_heads"],
+            head_dim=cfg["head_dim"],
+            num_kv_groups=cfg["n_kv_groups"],
+            qk_norm=cfg["qk_norm"],
+            dtype=cfg["dtype"]
+        )
+        self.ff = FeedForward(cfg)
+        self.norm1 = RMSNorm(cfg["emb_dim"], eps=1e-6)
+        self.norm2 = RMSNorm(cfg["emb_dim"], eps=1e-6)
 
-    if top_p < 1.0:
-        probs = F.softmax(logits.float(), dim=-1)
-        sorted_probs, sorted_indices = torch.sort(probs, descending=True, dim=-1)
-        cumulative = torch.cumsum(sorted_probs, dim=-1)
+    def forward(self, x, mask, cos, sin):
+        # Shortcut connection for attention block
+        shortcut = x
+        x = self.norm1(x)
+        x = self.att(x, mask, cos, sin)  # Shape [batch_size, num_tokens, emb_size]
+        x = x + shortcut  # Add the original input back
 
-        remove = cumulative > top_p
-        remove[..., 1:] = remove[..., :-1].clone()
-        remove[..., 0] = False
+        # Shortcut connection for feed-forward block
+        shortcut = x
+        x = self.norm2(x)
+        x = self.ff(x)
+        x = x + shortcut  # Add the original input back
 
-        sorted_probs = sorted_probs.masked_fill(remove, 0.0)
-        sorted_probs = sorted_probs / sorted_probs.sum(dim=-1, keepdim=True)
-        next_sorted = torch.multinomial(sorted_probs, num_samples=1)
-        return sorted_indices.gather(-1, next_sorted).squeeze(-1)
-
-    probs = F.softmax(logits.float(), dim=-1)
-    return torch.multinomial(probs, num_samples=1).squeeze(-1)
-
-
-@torch.inference_mode()
-def generate(
-    model: Qwen2ForCausalLMPure,
-    tokenizer: Qwen2TokenizerPure,
-    messages: List[dict],
-    max_new_tokens: int,
-    temperature: float,
-    top_p: float,
-    device: torch.device,
-) -> str:
-    prompt_text = tokenizer.apply_chat_template(messages, add_generation_prompt=True)
-    prompt_ids = tokenizer.encode(prompt_text)
-    if not prompt_ids:
-        raise ValueError("Prompt encoded to zero tokens.")
-
-    input_ids = torch.tensor([prompt_ids], dtype=torch.long, device=device)
-    logits, cache = model(input_ids, past_key_values=None, use_cache=True)
-
-    generated: List[int] = []
-    next_logits = logits[:, -1, :]
-
-    for _ in range(max_new_tokens):
-        next_token = sample_next_token(next_logits, temperature=temperature, top_p=top_p)
-        token_id = int(next_token.item())
-
-        if token_id == tokenizer.eos_token_id:
-            break
-
-        generated.append(token_id)
-
-        step_ids = next_token.view(1, 1).to(device=device)
-        logits, cache = model(step_ids, past_key_values=cache, use_cache=True)
-        next_logits = logits[:, -1, :]
-
-    return tokenizer.decode(generated, skip_special_tokens=True).strip()
+        return x
 
 
-def build_model(model_dir: str, device: torch.device, dtype: torch.dtype) -> Qwen2ForCausalLMPure:
-    cfg = Qwen2ConfigPure.from_json(os.path.join(model_dir, "config.json"))
-    model = Qwen2ForCausalLMPure(cfg, device=device, dtype=dtype)
-    load_safetensors_into_model(model, model_dir)
-    model.eval()
-    return model
+class Qwen3Model(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+
+        # Main model parameters
+        self.tok_emb = nn.Embedding(cfg["vocab_size"], cfg["emb_dim"], dtype=cfg["dtype"])
+
+        self.trf_blocks = nn.ModuleList(  # ModuleList since Sequential can only accept one input, and we need `x, mask, cos, sin`
+            [TransformerBlock(cfg) for _ in range(cfg["n_layers"])]
+        )
+
+        self.final_norm = RMSNorm(cfg["emb_dim"])
+        self.out_head = nn.Linear(cfg["emb_dim"], cfg["vocab_size"], bias=False, dtype=cfg["dtype"])
+
+        # Reusable utilities
+        if cfg["head_dim"] is None:
+            head_dim = cfg["emb_dim"] // cfg["n_heads"]
+        else:
+            head_dim = cfg["head_dim"]
+        cos, sin = compute_rope_params(
+            head_dim=head_dim,
+            theta_base=cfg["rope_base"],
+            context_length=cfg["context_length"]
+        )
+        self.register_buffer("cos", cos, persistent=False)
+        self.register_buffer("sin", sin, persistent=False)
+        self.cfg = cfg
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model-dir", required=True, help="Directory containing Qwen2.5-0.5B-Instruct files.")
-    parser.add_argument("--prompt", default=None, help="Single prompt. If omitted, starts an interactive loop.")
-    parser.add_argument(
-        "--system",
-        default="You are Qwen, created by Alibaba Cloud. You are a helpful assistant.",
-        help="System prompt.",
+    def forward(self, in_idx):
+        # Forward pass
+        tok_embeds = self.tok_emb(in_idx)
+        x = tok_embeds
+
+        num_tokens = x.shape[1]
+        mask = torch.triu(torch.ones(num_tokens, num_tokens, device=x.device, dtype=torch.bool), diagonal=1)
+        
+        for block in self.trf_blocks:
+            x = block(x, mask, self.cos, self.sin)
+        x = self.final_norm(x)
+        logits = self.out_head(x.to(self.cfg["dtype"]))
+        return logits
+
+
+
+CHOOSE_MODEL = "0.6B"
+
+if CHOOSE_MODEL == "0.6B":
+    QWEN3_CONFIG = {
+        "vocab_size": 151_936,           # Vocabulary size
+        "context_length": 40_960,        # Context length that was used to train the model
+        "emb_dim": 1024,                 # Embedding dimension
+        "n_heads": 16,                   # Number of attention heads
+        "n_layers": 28,                  # Number of layers
+        "hidden_dim": 3072,              # Size of the intermediate dimension in FeedForward
+        "head_dim": 128,                 # Size of the heads in GQA
+        "qk_norm": True,                 # Whether to normalize queries and keys in GQA
+        "n_kv_groups": 8,                # Key-Value groups for grouped-query attention
+        "rope_base": 1_000_000.0,        # The base in RoPE's "theta"
+        "dtype": torch.bfloat16,         # Lower-precision dtype to reduce memory usage
+    }
+
+elif CHOOSE_MODEL == "1.7B":
+    QWEN3_CONFIG = {
+        "vocab_size": 151_936,
+        "context_length": 40_960,
+        "emb_dim": 2048,                 # 2x larger than above
+        "n_heads": 16,
+        "n_layers": 28,
+        "hidden_dim": 6144,              # 2x larger than above
+        "head_dim": 128,
+        "qk_norm": True,
+        "n_kv_groups": 8,
+        "rope_base": 1_000_000.0,
+        "dtype": torch.bfloat16,
+    }   
+
+elif CHOOSE_MODEL == "4B":
+    QWEN3_CONFIG = {
+        "vocab_size": 151_936,
+        "context_length": 40_960,
+        "emb_dim": 2560,                 # 25% larger than above
+        "n_heads": 32,                   # 2x larger than above
+        "n_layers": 36,                  # 29% larger than above
+        "hidden_dim": 9728,              # ~3x larger than above
+        "head_dim": 128,
+        "qk_norm": True,
+        "n_kv_groups": 8,
+        "rope_base": 1_000_000.0,
+        "dtype": torch.bfloat16,
+    }  
+
+elif CHOOSE_MODEL == "8B":
+    QWEN3_CONFIG = {
+        "vocab_size": 151_936,
+        "context_length": 40_960,
+        "emb_dim": 4096,                 # 60% larger than above
+        "n_heads": 32,
+        "n_layers": 36,                  # 26% larger than above
+        "hidden_dim": 12288,
+        "head_dim": 128,
+        "qk_norm": True,
+        "n_kv_groups": 8,
+        "rope_base": 1_000_000.0,
+        "dtype": torch.bfloat16,
+    } 
+
+elif CHOOSE_MODEL == "14B":
+    QWEN3_CONFIG = {
+        "vocab_size": 151_936,
+        "context_length": 40_960,
+        "emb_dim": 5120,                 # 25% larger than above
+        "n_heads": 40,                   # 25% larger than above
+        "n_layers": 40,                  # 11% larger than above
+        "hidden_dim": 17408,             # 42% larger than above
+        "head_dim": 128,
+        "qk_norm": True,
+        "n_kv_groups": 8,
+        "rope_base": 1_000_000.0,
+        "dtype": torch.bfloat16,
+    } 
+
+elif CHOOSE_MODEL == "32B":
+    QWEN3_CONFIG = {
+        "vocab_size": 151_936,
+        "context_length": 40_960,
+        "emb_dim": 5120,                
+        "n_heads": 64,                   # 60% larger than above
+        "n_layers": 64,                  # 60% larger than above
+        "hidden_dim": 25600,             # 47% larger than above
+        "head_dim": 128,
+        "qk_norm": True,
+        "n_kv_groups": 8,
+        "rope_base": 1_000_000.0,
+        "dtype": torch.bfloat16,
+    } 
+
+else:
+    raise ValueError(f"{CHOOSE_MODEL} is not supported.")
+
+
+
+torch.manual_seed(123)
+model = Qwen3Model(QWEN3_CONFIG)
+
+
+######################################################################## Model Architecture
+
+Qwen3Model(
+  (tok_emb): Embedding(151936, 1024)
+  (trf_blocks): ModuleList(
+    (0-27): 28 x TransformerBlock(
+      (att): GroupedQueryAttention(
+        (W_query): Linear(in_features=1024, out_features=2048, bias=False)
+        (W_key): Linear(in_features=1024, out_features=1024, bias=False)
+        (W_value): Linear(in_features=1024, out_features=1024, bias=False)
+        (out_proj): Linear(in_features=2048, out_features=1024, bias=False)
+        (q_norm): RMSNorm()
+        (k_norm): RMSNorm()
+      )
+      (ff): FeedForward(
+        (fc1): Linear(in_features=1024, out_features=3072, bias=False)
+        (fc2): Linear(in_features=1024, out_features=3072, bias=False)
+        (fc3): Linear(in_features=3072, out_features=1024, bias=False)
+      )
+      (norm1): RMSNorm()
+      (norm2): RMSNorm()
     )
-    parser.add_argument("--max-new-tokens", type=int, default=256)
-    parser.add_argument("--temperature", type=float, default=0.7, help="Use 0 for greedy decoding.")
-    parser.add_argument("--top-p", type=float, default=0.8)
-    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--dtype", default="auto", choices=["auto", "bf16", "bfloat16", "fp16", "float16", "fp32", "float32"])
-    args = parser.parse_args()
+  )
+  (final_norm): RMSNorm()
+  (out_head): Linear(in_features=1024, out_features=151936, bias=False)
+)
 
-    device = torch.device(args.device)
-    dtype = pick_dtype(args.dtype, device)
+########################################################################
 
-    tokenizer = Qwen2TokenizerPure(args.model_dir)
-    model = build_model(args.model_dir, device=device, dtype=dtype)
+total_params = sum(p.numel() for p in model.parameters())
+print(f"Total number of parameters: {total_params:,}")
 
-    if args.prompt is not None:
-        messages = [
-            {"role": "system", "content": args.system},
-            {"role": "user", "content": args.prompt},
-        ]
-        print(
-            generate(
-                model=model,
-                tokenizer=tokenizer,
-                messages=messages,
-                max_new_tokens=args.max_new_tokens,
-                temperature=args.temperature,
-                top_p=args.top_p,
-                device=device,
+# Account for weight tying
+total_params_normalized = total_params - model.tok_emb.weight.numel()
+print(f"\nTotal number of unique parameters: {total_params_normalized:,}")
+
+def calc_model_memory_size(model, input_dtype=torch.float32):
+    total_params = 0
+    total_grads = 0
+    for param in model.parameters():
+        # Calculate total number of elements per parameter
+        param_size = param.numel()
+        total_params += param_size
+        # Check if gradients are stored for this parameter
+        if param.requires_grad:
+            total_grads += param_size
+
+    # Calculate buffer size (non-parameters that require memory)
+    total_buffers = sum(buf.numel() for buf in model.buffers())
+
+    # Size in bytes = (Number of elements) * (Size of each element in bytes)
+    # We assume parameters and gradients are stored in the same type as input dtype
+    element_size = torch.tensor(0, dtype=input_dtype).element_size()
+    total_memory_bytes = (total_params + total_grads + total_buffers) * element_size
+
+    # Convert bytes to gigabytes
+    total_memory_gb = total_memory_bytes / (1024**3)
+
+    return total_memory_gb
+
+print(f"float32 (PyTorch default): {calc_model_memory_size(model, input_dtype=torch.float32):.2f} GB")
+print(f"bfloat16: {calc_model_memory_size(model, input_dtype=torch.bfloat16):.2f} GB")
+
+if torch.cuda.is_available():
+    device = torch.device("cuda")
+elif torch.backends.mps.is_available():
+    device = torch.device("mps")
+else:
+    device = torch.device("cpu")
+
+model.to(device);
+
+
+
+###### 3. Load Pre-Trained Weights
+
+def load_weights_into_qwen(model, param_config, params):
+    def assign(left, right, tensor_name="unknown"):
+        if left.shape != right.shape:
+            raise ValueError(f"Shape mismatch in tensor '{tensor_name}'. Left: {left.shape}, Right: {right.shape}")
+        
+        with torch.no_grad():
+            if isinstance(right, torch.Tensor):
+                left.copy_(right)
+            else:
+                left.copy_(torch.as_tensor(right, dtype=left.dtype, device=left.device))
+    
+        return left 
+
+    model.tok_emb.weight = assign(model.tok_emb.weight, params["model.embed_tokens.weight"], "model.embed_tokens.weight")
+
+    for l in range(param_config["n_layers"]):
+        block = model.trf_blocks[l]
+        att = block.att
+
+        # Q, K, V projections
+        att.W_query.weight = assign(
+            att.W_query.weight,
+            params[f"model.layers.{l}.self_attn.q_proj.weight"],
+            f"model.layers.{l}.self_attn.q_proj.weight"
+        )
+        att.W_key.weight = assign(
+            att.W_key.weight,
+            params[f"model.layers.{l}.self_attn.k_proj.weight"],
+            f"model.layers.{l}.self_attn.k_proj.weight"
+        )
+        att.W_value.weight = assign(
+            att.W_value.weight,
+            params[f"model.layers.{l}.self_attn.v_proj.weight"],
+            f"model.layers.{l}.self_attn.v_proj.weight"
+        )
+
+        # Output projection
+        att.out_proj.weight = assign(
+            att.out_proj.weight,
+            params[f"model.layers.{l}.self_attn.o_proj.weight"],
+            f"model.layers.{l}.self_attn.o_proj.weight"
+        )
+
+        # QK norms
+        if hasattr(att, "q_norm") and att.q_norm is not None:
+            att.q_norm.scale = assign(
+                att.q_norm.scale,
+                params[f"model.layers.{l}.self_attn.q_norm.weight"],
+                f"model.layers.{l}.self_attn.q_norm.weight"
             )
+        if hasattr(att, "k_norm") and att.k_norm is not None:
+            att.k_norm.scale = assign(
+                att.k_norm.scale,
+                params[f"model.layers.{l}.self_attn.k_norm.weight"],
+                f"model.layers.{l}.self_attn.k_norm.weight"
+            )
+
+        # Attention layernorm
+        block.norm1.scale = assign(
+            block.norm1.scale,
+            params[f"model.layers.{l}.input_layernorm.weight"],
+            f"model.layers.{l}.input_layernorm.weight"
         )
-        return
 
-    history: List[dict] = [{"role": "system", "content": args.system}]
-    print("Pure PyTorch Qwen2.5-0.5B-Instruct chat. Type 'exit' or 'quit' to stop.")
-
-    while True:
-        user_text = input("\nUser: ").strip()
-        if user_text.lower() in {"exit", "quit"}:
-            break
-        if not user_text:
-            continue
-
-        history.append({"role": "user", "content": user_text})
-        answer = generate(
-            model=model,
-            tokenizer=tokenizer,
-            messages=history,
-            max_new_tokens=args.max_new_tokens,
-            temperature=args.temperature,
-            top_p=args.top_p,
-            device=device,
+        # Feedforward weights
+        block.ff.fc1.weight = assign(
+            block.ff.fc1.weight,
+            params[f"model.layers.{l}.mlp.gate_proj.weight"],
+            f"model.layers.{l}.mlp.gate_proj.weight"
         )
-        print(f"\nQwen: {answer}")
-        history.append({"role": "assistant", "content": answer})
+        block.ff.fc2.weight = assign(
+            block.ff.fc2.weight,
+            params[f"model.layers.{l}.mlp.up_proj.weight"],
+            f"model.layers.{l}.mlp.up_proj.weight"
+        )
+        block.ff.fc3.weight = assign(
+            block.ff.fc3.weight,
+            params[f"model.layers.{l}.mlp.down_proj.weight"],
+            f"model.layers.{l}.mlp.down_proj.weight"
+        )
+        block.norm2.scale = assign(
+            block.norm2.scale,
+            params[f"model.layers.{l}.post_attention_layernorm.weight"],
+            f"model.layers.{l}.post_attention_layernorm.weight"
+        )
+
+    # Final normalization and output head
+    model.final_norm.scale = assign(model.final_norm.scale, params["model.norm.weight"], "model.norm.weight")
+
+    if "lm_head.weight" in params:
+        model.out_head.weight = assign(model.out_head.weight, params["lm_head.weight"], "lm_head.weight")
+    else:
+        model.out_head.weight = model.tok_emb.weight
+        print("Model uses weight tying.")
 
 
-if __name__ == "__main__":
-    main()
+
+import json
+import os
+from pathlib import Path
+from safetensors.torch import load_file
+from huggingface_hub import hf_hub_download, snapshot_download
+
+
+if USE_REASONING_MODEL or USE_INSTRUCT_MODEL:
+    repo_id = f"Qwen/Qwen3-{CHOOSE_MODEL}"
+else:
+    repo_id = f"Qwen/Qwen3-{CHOOSE_MODEL}-Base"
+
+local_dir = Path(repo_id).parts[-1]
+
+if CHOOSE_MODEL == "0.6B":
+    weights_file = hf_hub_download(
+        repo_id=repo_id,
+        filename="model.safetensors",
+        local_dir=local_dir,
+    )
+    weights_dict = load_file(weights_file)
+else:
+    repo_dir = snapshot_download(repo_id=repo_id, local_dir=local_dir)
+    index_path = os.path.join(repo_dir, "model.safetensors.index.json")
+    with open(index_path, "r") as f:
+        index = json.load(f)
+
+    weights_dict = {}
+    for filename in set(index["weight_map"].values()):
+        shard_path = os.path.join(repo_dir, filename)
+        shard = load_file(shard_path)
+        weights_dict.update(shard)
+
+load_weights_into_qwen(model, QWEN3_CONFIG, weights_dict)
+model.to(device)
+del weights_dict
+
+
+
+
+############### 4 Load Tokenizer
+import re
+from tokenizers import Tokenizer
+
+class Qwen3Tokenizer:
+    _SPECIALS = [
+        "<|endoftext|>",
+        "<|im_start|>", "<|im_end|>",
+        "<|object_ref_start|>", "<|object_ref_end|>",
+        "<|box_start|>", "<|box_end|>",
+        "<|quad_start|>", "<|quad_end|>",
+        "<|vision_start|>", "<|vision_end|>",
+        "<|vision_pad|>", "<|image_pad|>", "<|video_pad|>",
+        "<think>", "</think>"
+    ]
+    _SPLIT_RE = re.compile(r"(<\|[^>]+?\|>|<think>|</think>)")
+
+    def __init__(self, tokenizer_file_path="tokenizer.json", repo_id=None,
+                 apply_chat_template=True, add_generation_prompt=False, add_thinking=False):
+
+        self.apply_chat_template = apply_chat_template
+        self.add_generation_prompt = add_generation_prompt
+        self.add_thinking = add_thinking
+
+        tok_file = Path(tokenizer_file_path)
+        self._tok = Tokenizer.from_file(str(tok_file))
+        self._special_to_id = {}
+        for t in self._SPECIALS:
+            tid = self._tok.token_to_id(t)
+            if tid is not None:
+                self._special_to_id[t] = tid
+
+        self.pad_token_id = self._special_to_id["<|endoftext|>"]
+        self.eos_token_id = self.pad_token_id
+
+        if repo_id and "Base" not in repo_id:
+            eos_token = "<|im_end|>"
+        else:
+            eos_token = "<|endoftext|>"
+        if eos_token in self._special_to_id:
+            self.eos_token_id = self._special_to_id[eos_token]
+
+    def encode(self, text, chat_wrapped=None):
+        if chat_wrapped is None:
+            chat_wrapped = self.apply_chat_template
+
+        stripped = text.strip()
+        if stripped in self._special_to_id and "\n" not in stripped:
+            return [self._special_to_id[stripped]]
+
+        if chat_wrapped:
+            text = self._wrap_chat(text)
+
+        ids = []
+        for part in filter(None, self._SPLIT_RE.split(text)):
+            if part in self._special_to_id:
+                ids.append(self._special_to_id[part])
+            else:
+                ids.extend(self._tok.encode(part).ids)
+        return ids
+
+    def decode(self, ids):
+        return self._tok.decode(ids, skip_special_tokens=False)
+
+    def _wrap_chat(self, user_msg):
+        s = f"<|im_start|>user\n{user_msg}<|im_end|>\n"
+        if self.add_generation_prompt:
+            s += "<|im_start|>assistant"
+            if self.add_thinking:
+                s += "\n"
+            else:
+                s += "\n<think>\n\n</think>\n\n"
+        return s
+
+
+
+if USE_REASONING_MODEL:
+    tokenizer_file_path = f"Qwen3-{CHOOSE_MODEL}/tokenizer.json"
+else:
+    tokenizer_file_path = f"Qwen3-{CHOOSE_MODEL}-Base/tokenizer.json"
+
+hf_hub_download(
+    repo_id=repo_id,
+    filename="tokenizer.json",
+    local_dir=local_dir,
+)
+
+if USE_REASONING_MODEL or USE_INSTRUCT_MODEL:
+    tokenizer = Qwen3Tokenizer(
+        tokenizer_file_path=tokenizer_file_path,
+        repo_id=repo_id,
+        apply_chat_template=True,
+        add_generation_prompt=True,
+        add_thinking=USE_REASONING_MODEL
+    )
+
+else:
+    tokenizer = Qwen3Tokenizer(
+        tokenizer_file_path=tokenizer_file_path,
+        repo_id=repo_id,
+        apply_chat_template=False,
+        add_generation_prompt=False,
+        add_thinking=False
+    )
+
+
+prompt = "Give me a short introduction to large language models."
+
+input_token_ids = tokenizer.encode(prompt)
+text = tokenizer.decode(input_token_ids)
+print(text)
+
+
+###### 4, Generate Text
+def generate_text_basic_stream(model, token_ids, max_new_tokens, eos_token_id=None):
+
+    model.eval()
+    with torch.no_grad():
+        for _ in range(max_new_tokens):
+            out = model(token_ids)[:, -1]
+            next_token = torch.argmax(out, dim=-1, keepdim=True)
+
+            if (eos_token_id is not None
+                   and torch.all(next_token == eos_token_id)):
+               break
+
+            yield next_token
+            
+            token_ids = torch.cat([token_ids, next_token], dim=1)
+
+import time
+
+input_token_ids_tensor = torch.tensor(input_token_ids, device=device).unsqueeze(0)
+
+if torch.cuda.is_available():
+    torch.cuda.reset_peak_memory_stats()
+
+start_time = time.perf_counter()
+generated_tokens = 0
+
+for token in generate_text_basic_stream(
+    model=model,
+    token_ids=input_token_ids_tensor,
+    max_new_tokens=500,
+    eos_token_id=tokenizer.eos_token_id
+):
+    generated_tokens += 1
+    token_id = token.squeeze(0).tolist()
+    print(
+        tokenizer.decode(token_id),
+        end="",
+        flush=True
+    )
+
+elapsed = time.perf_counter() - start_time
+tokens_per_sec = generated_tokens / elapsed if elapsed > 0 else 0.0
+print(f"\n\nGeneration speed: {tokens_per_sec:.2f} tokens/sec")
+
+if torch.cuda.is_available():
+    def calc_gpu_gb(x):
+        return f"{x / 1024 / 1024 / 1024:.2f} GB"
+
+    print(f"GPU memory used: {calc_gpu_gb(torch.cuda.max_memory_allocated())}")
